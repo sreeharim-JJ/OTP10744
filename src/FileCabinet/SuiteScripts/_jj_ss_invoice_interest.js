@@ -1,210 +1,379 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType ScheduledScript
+ * @NModuleScope SameAccount
  */
 // /******************************************************************************
-// ********
-//  * Test Company
+//  *******
+//  * OTP TASK
 //  *
 //  * ${OTP10744}: ${Develop and deploy a scheduled script (APPLYING INTEREST ON INVOICES OVERDUE BY 45 DAYS)}
 //  *
 //  *
 //  ******************************************************************************
-// ********
+//  *******
 //  *
 //  * Author: Jobin and Jismi IT Services
 //  *
 //  * Date Created : 11-November-2026
 //  *
-//  * Description : Develop and deploy a daily scheduled script to automatically apply a 5% penalty to invoices that remain unpaid after 45 days. Additionally, apply an ongoing 1.5% interest charge every 30 days thereafter until the balance is paid in full. Create a new 'Other Charges' 
-//  * item named 'Order Penalty' and add it to the invoice to update the total payable amount.
+//  * Description : This script is for an automated invoice penalty management system that applies penalty and interest charges to unpaid invoices once they become overdue. A daily scheduled script will identify invoices that remain unpaid 
+//  * for more than 45 days and automatically add a 5% penalty using the "Order Penalty" item. Thereafter, for every additional 30 days the invoice remains unpaid, an extra 1.5% interest charge will be applied and added to the invoice through 
+//  * the same penalty item, ensuring that invoice balances accurately reflect all overdue charges.
 //  *
 //  * REVISION HISTORY
 //  *
-//  * @version 1.0 Test Company   : 11-November-2026 : Created the initial build by JJ0494
+//  * @version 1.0  OTP TASK : 11-November-2026 : Created the initial build by JJ0494
 //  *
 //  *
 //  ******************************************************************************
 // *********/
-define(['N/search', 'N/record', 'N/runtime', 'N/format', 'N/log'],
-    function (search, record, runtime, format, log) {
 
-        const PENALTY_PERCENT = 5;
-        const DAYS_BEFORE_PENALTY = 45;
-        const MS_PER_DAY = 24 * 60 * 60 * 1000;
-        const MIN_GOVERNANCE_LEFT = 200;
+define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log'],
+    function (search, record, format, runtime, log) {
 
-        function execute(scriptcontext) {
+        // Constants Configuration
+        let PENALTY_ITEM_ID = 3679;
+        let INITIAL_PENALTY_DAYS = 45;
+        let INTEREST_INTERVAL_DAYS = 30;
+        let INITIAL_PENALTY_RATE = 0.05;     // 5%
+        let RECURRING_INTEREST_RATE = 0.015; // 1.5%
+
+        let MAX_INVOICES = 50;      // TEST: stop after this many invoices are charged (0 = no limit)
+        let GOVERNANCE_FLOOR = 200; // stop when fewer than this many usage units are left
+
+        let FIELDS = {
+            APPLIED: 'custbody_jj_penalty_applied',
+            APPLIED_DATE: 'custbody_jj_penalty_applied_date',
+            CYCLES: 'custbody_jj_interest_cycles_applied',
+            LAST_INTEREST: 'custbody_jj_last_interest_date',
+            EXCLUDE: 'custbody_jj_exclude_from_penalty'
+        };
+
+        let DAY_MS = 1000 * 60 * 60 * 24;
+
+        /**
+         * Finds the open accounting periods. An invoice can only be edited
+         * when its posting period is open.
+         */
+        function getOpenPeriodIds() {
+            let baseFilters = [
+                ['isquarter', 'is', 'F'], 'AND',
+                ['isyear', 'is', 'F'], 'AND',
+                ['closed', 'is', 'F']
+            ];
+            let lockFilters = [
+                'AND', ['alllocked', 'is', 'F'],
+                'AND', ['arlocked', 'is', 'F']
+            ];
+
+            function runPeriodSearch(filters) {
+                let periods = [];
+                search.create({
+                    type: search.Type.ACCOUNTING_PERIOD,
+                    filters: filters,
+                    columns: ['periodname']
+                }).run().each(function (r) {
+                    periods.push({ id: r.id, name: r.getValue('periodname') });
+                    return true;
+                });
+                return periods;
+            }
+
+            var periods;
+            try {
+                periods = runPeriodSearch(baseFilters.concat(lockFilters));
+            } catch (e) {
+                log.error('Open period search with lock filters failed',
+                    e.message + ' - falling back to not-closed periods only');
+                periods = runPeriodSearch(baseFilters);
+            }
+
+            log.audit('Open accounting periods',
+                periods.length + ' found: ' + periods.map(function (p) {
+                    return p.name + ' (id ' + p.id + ')';
+                }).join(', '));
+
+            return periods.map(function (p) {
+                return p.id;
+            });
+        }
+
+        /**
+         * Turns common NetSuite save errors into a readable hint for the log.
+         */
+        function explainError(message) {
+            let m = String(message || '');
+            if (m.indexOf('is not valid for item') > -1) {
+                return 'HINT: an existing line item is not available to the invoice subsidiary. Fix the item\'s Subsidiary list, or tick "Exclude from penalty" on this invoice.';
+            }
+            if (m.indexOf('discount item') > -1) {
+                return 'HINT: the invoice/customer has a discount but no discount item. Fix the invoice, or tick "Exclude from penalty".';
+            }
+            if (m.indexOf('VALID_PRD_REQD') > -1 || m.indexOf('tax period') > -1) {
+                return 'HINT: the invoice posting period is closed.';
+            }
+            if (m.indexOf('TRANS_UNBALNCD') > -1) {
+                return 'HINT: the invoice is out of balance (check currency / rounding).';
+            }
+            return '';
+        }
+
+        /**
+         * Logs a long list in parts, so each log entry stays under NetSuite's log size limit.
+         */
+        function logList(title, items) {
+            if (!items.length) {
+                log.audit(title, 'No invoices were charged in this run.');
+                return;
+            }
+            let MAX_CHARS = 3000;
+            let part = 1;
+            let current = [];
+            let currentLength = 0;
+
+            for (let i = 0; i < items.length; i++) {
+                if (currentLength + items[i].length > MAX_CHARS && current.length) {
+                    log.audit(title + ' (part ' + part + ')', current.join('\n'));
+                    part++;
+                    current = [];
+                    currentLength = 0;
+                }
+                current.push(items[i]);
+                currentLength += items[i].length + 1;
+            }
+
+            log.audit(part > 1 ? title + ' (part ' + part + ')' : title, current.join('\n'));
+        }
+
+        /**
+         * Main execution entry point for the Scheduled Script.
+         */
+        function execute(context) {
+            let script = runtime.getCurrentScript();
+            let today = new Date();
+            today.setHours(0, 0, 0, 0);
+            let todayStr = format.format({ value: today, type: format.Type.DATE });
+
+            log.audit('Script started',
+                'Today: ' + todayStr +
+                ' | Penalty ' + (INITIAL_PENALTY_RATE * 100) + '% after ' + INITIAL_PENALTY_DAYS + ' days' +
+                ' | Interest ' + (RECURRING_INTEREST_RATE * 100) + '% every ' + INTEREST_INTERVAL_DAYS + ' days' +
+                ' | Item id ' + PENALTY_ITEM_ID +
+                ' | Max invoices this run: ' + (MAX_INVOICES || 'no limit'));
+
+            let openPeriodIds = getOpenPeriodIds();
+            if (!openPeriodIds.length) {
+                log.audit('Script finished', 'No open accounting periods found. Nothing to do.');
+                return;
+            }
+
+            // Only invoices created 45+ days ago can ever be charged
+            let cutoff = new Date(today.getTime() - INITIAL_PENALTY_DAYS * DAY_MS);
+            let cutoffStr = format.format({ value: cutoff, type: format.Type.DATE });
+            log.debug('Search filter', 'Created on or before ' + cutoffStr + ' and posted in an open period');
+
+            // Search Open Invoices not excluded from penalties
+            let invoiceSearch = search.create({
+                type: search.Type.INVOICE,
+                filters: [
+                    ['mainline', 'is', 'T'],
+                    'AND',
+                    ['status', 'anyof', 'CustInvc:A'],
+                    'AND',
+                    ['amountremaining', 'greaterthan', '0'],
+                    'AND',
+                    [FIELDS.EXCLUDE, 'is', 'F'],
+                    'AND',
+                    ['trandate', 'onorafter', '6/1/2026']
+                ],
+                columns: [
+                    search.createColumn({ name: 'internalid' }),
+                    search.createColumn({ name: 'tranid' }),
+                    search.createColumn({ name: 'datecreated', sort: search.Sort.ASC }),
+                    search.createColumn({ name: 'amountremaining' }),
+                    search.createColumn({ name: FIELDS.APPLIED }),
+                    search.createColumn({ name: FIELDS.CYCLES })
+                ]
+            });
+
+            let counts = { found: 0, penalty: 0, interest: 0, skipped: 0, errors: 0 };
+            let failedInvoices = [];
+            let succeededInvoices = [];
+            let stopReason = 'all invoices processed';
 
             try {
-                let script = runtime.getCurrentScript();
-                let PENALTY_ITEM_ID = 3679;
-                let testCustomer = script.getParameter({ name: 'custscript_jj_pen_test_customer' });
-
-                if (!PENALTY_ITEM_ID) {
-                    throw new Error('Script parameter custscript_pen_item_id (Order Penalty item ID) is not set.');
-                }
-
-                // Today at midnight, so we count whole days
-                let today = new Date();
-                today.setHours(0, 0, 0, 0);
-
-                // Invoices dated on or before this are at least 45 days old
-                let cutoff = new Date(today.getTime() - DAYS_BEFORE_PENALTY * MS_PER_DAY);
-
-                log.audit('START', 'Today: ' + today.toDateString() + ' | Cutoff: ' + cutoff.toDateString() +
-                    ' | Item ID: ' + PENALTY_ITEM_ID + ' | Test customer: ' + (testCustomer || 'ALL'));
-
-                let filters = [
-                    ['mainline', 'is', 'T'],
-                    'AND', ['status', 'anyof', 'CustInvc:A'],                       // Open Invoices
-                    'AND', ['amountremaining', 'greaterthan', '0.00'],
-                    'AND', ['custbody_jj_exclude_from_penalty', 'is', 'F'],
-                    'AND', ['trandate', 'onorbefore', format.format({ value: cutoff, type: format.Type.DATE })]
-                ];
-                if (testCustomer) {
-                    filters.push('AND', ['entity', 'anyof', testCustomer]);
-                }
-
-                let invoiceSearch = search.create({
-                    type: search.Type.INVOICE,
-                    filters: filters,
-                    columns: [
-                        'internalid',
-                        'tranid',
-                        'trandate',
-                        'amountremaining',
-                        'custbody_jj_penalty_applied',
-                        'custbody_jj_penalty_applied_date'
-                    ]
-                });
-
-                let found = 0, charged = 0, skipped = 0, failed = 0;
-
                 invoiceSearch.run().each(function (result) {
+                    counts.found++;
 
-                    // Stop safely if running out of governance units
-                    if (script.getRemainingUsage() < MIN_GOVERNANCE_LEFT) {
-                        log.audit('STOPPED EARLY', 'Low governance. Remaining invoices will be done in the next run.');
+                    // TEST LIMIT
+                    if (MAX_INVOICES > 0 && (counts.penalty + counts.interest) >= MAX_INVOICES) {
+                        stopReason = 'test limit of ' + MAX_INVOICES + ' charged invoices reached';
+                        return false;
+                    }
+                    // GOVERNANCE LIMIT
+                    if (script.getRemainingUsage() < GOVERNANCE_FLOOR) {
+                        stopReason = 'low governance units (' + script.getRemainingUsage() + ' left), next run will continue';
                         return false;
                     }
 
-                    found++;
-                    let invoiceId = result.getValue('internalid');
-                    let invoiceNumber = result.getValue('tranid');
+                    let invoiceId = result.getValue({ name: 'internalid' });
+                    let tranId = result.getValue({ name: 'tranid' });
+                    let dateCreatedRaw = result.getValue({ name: 'datecreated' });
+                    let amountDue = parseFloat(result.getValue({ name: 'amountremaining' })) || 0;
+
+                    let isPenaltyApplied = result.getValue({ name: FIELDS.APPLIED }) === true || result.getValue({ name: FIELDS.APPLIED }) === 'T';
+                    let cyclesApplied = parseInt(result.getValue({ name: FIELDS.CYCLES }), 10) || 0;
 
                     try {
-                        let amountRemaining = parseFloat(result.getValue('amountremaining')) || 0;
+                        // Calculate exact days since creation (date part only)
+                        let createdDate = format.parse({ value: String(dateCreatedRaw).split(' ')[0], type: format.Type.DATE });
+                        createdDate.setHours(0, 0, 0, 0);
 
-                        let penaltyApplied =
-                            result.getValue('custbody_jj_penalty_applied') === true ||
-                            result.getValue('custbody_jj_penalty_applied') === 'T';
+                        let diffTime = today.getTime() - createdDate.getTime();
+                        let daysOpen = Math.floor(diffTime / DAY_MS);
 
-                        // Parse the invoice date properly (NetSuite returns it as text in the account's date format)
-                        let invoiceDate = format.parse({
-                            value: result.getValue('trandate'),
-                            type: format.Type.DATE
-                        });
-                        invoiceDate.setHours(0, 0, 0, 0);
+                        log.debug('Invoice ' + tranId + ' (ID: ' + invoiceId + ') - checked',
+                            'Created: ' + format.format({ value: createdDate, type: format.Type.DATE }) +
+                            ' | Days open: ' + daysOpen +
+                            ' | Amount due: ' + amountDue +
+                            ' | Penalty applied: ' + isPenaltyApplied +
+                            ' | Cycles applied: ' + cyclesApplied);
 
-                        let daysOpen = Math.floor((today.getTime() - invoiceDate.getTime()) / MS_PER_DAY);
-
-                        log.debug('Invoice ' + invoiceNumber,
-                            'ID: ' + invoiceId + ' | Days open: ' + daysOpen +
-                            ' | Amount remaining: ' + amountRemaining +
-                            ' | Penalty applied: ' + penaltyApplied);
-
-                        // Nothing to do?
-                        if (penaltyApplied) {
-                            skipped++;
-                            log.debug('SKIPPED ' + invoiceNumber, 'Penalty already applied.');
-                            return true;
-                        }
-                        if (daysOpen < DAYS_BEFORE_PENALTY) {
-                            skipped++;
+                        // Skip if under 45 days
+                        if (daysOpen < INITIAL_PENALTY_DAYS) {
+                            counts.skipped++;
                             return true;
                         }
 
-                        // Load the invoice (only when a charge is needed)
-                        let invoiceRec = record.load({
-                            type: record.Type.INVOICE,
-                            id: invoiceId,
-                            isDynamic: true
-                        });
-
-                        // Work out the base amount for the percentage:
-                        // Amount Due minus any penalty lines already on the invoice
-                        let penaltyLinesTotal = 0;
-                        let lineCount = invoiceRec.getLineCount({ sublistId: 'item' });
-                        for (let i = 0; i < lineCount; i++) {
-                            let lineItem = invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
-                            if (String(lineItem) === String(PENALTY_ITEM_ID)) {
-                                penaltyLinesTotal += Number(
-                                    invoiceRec.getSublistValue({ sublistId: 'item', fieldId: 'amount', line: i })) || 0;
+                        // Case 1: Initial 5% Penalty has not been applied yet (Day 45+)
+                        if (!isPenaltyApplied) {
+                            let penaltyAmount = parseFloat((amountDue * INITIAL_PENALTY_RATE).toFixed(2));
+                            if (penaltyAmount > 0) {
+                                let penaltyDescription = '5% Late Payment Penalty (' + daysOpen + ' Days Overdue) - Applied on ' + todayStr;
+                                updateInvoiceWithCharge({
+                                    invoiceId: invoiceId,
+                                    tranId: tranId,
+                                    amount: penaltyAmount,
+                                    description: penaltyDescription,
+                                    today: today,
+                                    isInitialPenalty: true,
+                                    newCycleCount: cyclesApplied
+                                });
+                                counts.penalty++;
+                                succeededInvoices.push('Invoice ' + tranId + ' (ID: ' + invoiceId + ') - Penalty ' + penaltyAmount);
+                            } else {
+                                counts.skipped++;
                             }
                         }
-                        let base = roundCurrency(amountRemaining - penaltyLinesTotal);
+                        // Case 2: Initial penalty already applied; check if a new 30-day interest cycle is due
+                        else {
+                            let totalEligibleCycles = Math.floor((daysOpen - INITIAL_PENALTY_DAYS) / INTEREST_INTERVAL_DAYS);
 
-                        if (base <= 0) {
-                            skipped++;
-                            log.audit('SKIPPED ' + invoiceNumber, 'Base amount is ' + base + '.');
-                            return true;
+                            log.debug('Invoice ' + tranId + ' (ID: ' + invoiceId + ') - interest cycles',
+                                'Eligible cycles: ' + totalEligibleCycles + ' | Already applied: ' + cyclesApplied);
+
+                            if (totalEligibleCycles > cyclesApplied) {
+                                let newCycleNumber = cyclesApplied + 1;
+                                let interestAmount = parseFloat((amountDue * RECURRING_INTEREST_RATE).toFixed(2));
+
+                                if (interestAmount > 0) {
+                                    let interestDescription = '1.5% Monthly Late Interest - Cycle #' + newCycleNumber +
+                                        ' (' + daysOpen + ' Days Overdue) - Applied on ' + todayStr;
+                                    updateInvoiceWithCharge({
+                                        invoiceId: invoiceId,
+                                        tranId: tranId,
+                                        amount: interestAmount,
+                                        description: interestDescription,
+                                        today: today,
+                                        isInitialPenalty: false,
+                                        newCycleCount: newCycleNumber
+                                    });
+                                    counts.interest++;
+                                    succeededInvoices.push('Invoice ' + tranId + ' (ID: ' + invoiceId + ') - Interest cycle #' + newCycleNumber + ' ' + interestAmount);
+                                } else {
+                                    counts.skipped++;
+                                }
+                            } else {
+                                counts.skipped++;
+                            }
                         }
 
-                        // 5% penalty (once)
-                        let penaltyAmount = roundCurrency(base * PENALTY_PERCENT / 100);
-
-                        addChargeLine(invoiceRec, PENALTY_ITEM_ID, penaltyAmount,
-                            PENALTY_PERCENT + '% late payment penalty - ' + daysOpen + ' days open');
-
-                        invoiceRec.setValue({ fieldId: 'custbody_jj_penalty_applied', value: true });
-                        invoiceRec.setValue({ fieldId: 'custbody_jj_penalty_applied_date', value: today });
-
-                        log.audit('Penalty Applied', 'Invoice: ' + invoiceNumber + ' | ' +
-                            PENALTY_PERCENT + '% of ' + base + ' = ' + penaltyAmount);
-
-                        invoiceRec.save({
-                            enableSourcing: true,
-                            ignoreMandatoryFields: true
-                        });
-
-                        charged++;
-                        log.audit('SAVED ' + invoiceNumber, 'Invoice ID ' + invoiceId + ' updated.');
-
                     } catch (e) {
-                        failed++;
-                        log.error({
-                            title: 'Invoice Processing Error - ' + invoiceNumber + ' (ID ' + invoiceId + ')',
-                            details: e.name + ': ' + e.message
-                        });
+                        counts.errors++;
+                        failedInvoices.push(tranId);
+                        log.error('Error Processing Invoice ' + tranId + ' (ID: ' + invoiceId + ')',
+                            e.message + ' ' + explainError(e.message));
                     }
 
                     return true;
                 });
+            } catch (fatalError) {
+                // unexpected error (for example governance/usage limit): log it and still print the summary
+                stopReason = 'unexpected error: ' + fatalError.name + ' - ' + fatalError.message;
+                log.error('Script stopped by an unexpected error', fatalError.name + ': ' + fatalError.message);
+            } finally {
+                // Full list of invoices that were charged successfully (always printed)
+                logList('Invoices charged successfully (' + succeededInvoices.length + ')', succeededInvoices);
+            }
 
-                log.audit('SUMMARY', 'Found: ' + found + ' | Charged: ' + charged +
-                    ' | Skipped: ' + skipped + ' | Failed: ' + failed +
-                    ' | Usage left: ' + script.getRemainingUsage());
+            log.audit('Script finished',
+                'Stopped because: ' + stopReason +
+                ' | Invoices read: ' + counts.found +
+                ' | Penalties added: ' + counts.penalty +
+                ' | Interest added: ' + counts.interest +
+                ' | Skipped: ' + counts.skipped +
+                ' | Errors: ' + counts.errors +
+                ' | Governance units left: ' + script.getRemainingUsage());
 
-            } catch (e) {
-                log.error({ title: 'Scheduled Script Error', details: e.name + ': ' + e.message });
-                throw e; // so the script shows as FAILED in the deployment status
+            if (failedInvoices.length) {
+                log.error('Invoices that failed', failedInvoices.join(', '));
             }
         }
 
-        // Adds one 'Order Penalty' line to an invoice that is open in dynamic mode
-        function addChargeLine(invoiceRec, itemId, amount, description) {
-            invoiceRec.selectNewLine({ sublistId: 'item' });
-            invoiceRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: itemId });
-            invoiceRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: 1 });
-            invoiceRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'price', value: -1 }); // Custom price level
-            invoiceRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate', value: amount });
-            invoiceRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: description });
-            invoiceRec.commitLine({ sublistId: 'item' });
-        }
+        /**
+         * Loads the invoice, appends the Order Penalty line item (ID 3679), and updates tracking body fields.
+         */
+        function updateInvoiceWithCharge(params) {
+            let invoiceId = params.invoiceId;
+            let tranId = params.tranId;
+            let amount = params.amount;
+            let description = params.description;
+            let today = params.today;
+            let isInitialPenalty = params.isInitialPenalty;
+            let newCycleCount = params.newCycleCount;
 
-        function roundCurrency(amount) {
-            return Math.round(amount * 100) / 100;
+            let invRecord = record.load({
+                type: record.Type.INVOICE,
+                id: invoiceId,
+                isDynamic: true
+            });
+
+            // Add Order Penalty line item
+            invRecord.selectNewLine({ sublistId: 'item' });
+            invRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: PENALTY_ITEM_ID });
+            invRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: 1 });
+            invRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate', value: amount });
+            invRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: amount });
+            invRecord.setCurrentSublistValue({ sublistId: 'item', fieldId: 'description', value: description });
+            invRecord.commitLine({ sublistId: 'item' });
+
+            // Update Custom Tracking Fields
+            if (isInitialPenalty) {
+                invRecord.setValue({ fieldId: FIELDS.APPLIED, value: true });
+                invRecord.setValue({ fieldId: FIELDS.APPLIED_DATE, value: today });
+            } else {
+                invRecord.setValue({ fieldId: FIELDS.CYCLES, value: newCycleCount });
+                invRecord.setValue({ fieldId: FIELDS.LAST_INTEREST, value: today });
+            }
+
+            invRecord.save({
+                enableSourcing: true,
+                ignoreMandatoryFields: true
+            });
+
+            log.audit('Charge Applied',
+                'Invoice ' + tranId + ' (ID: ' + invoiceId + ') updated with ' + amount + ' | ' + description);
         }
 
         return {
